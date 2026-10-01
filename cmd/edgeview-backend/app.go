@@ -35,6 +35,7 @@ type zededaAPI interface {
 	GetEdgeViewStatus(nodeID string) (*zededa.EdgeViewStatus, error)
 	DisableSSH(nodeID, ourKey string) error
 	StopEdgeView(nodeID string) error
+	DisableEdgeView(nodeID string) error
 	StartEdgeView(nodeID string) error
 	SetVGAEnabled(nodeID string, enabled bool) error
 	SetUSBEnabled(nodeID string, enabled bool) error
@@ -1322,6 +1323,25 @@ func (a *App) ResetEdgeView(nodeID string) error {
 	// freshly recycled cloud session. Without this, reset only recycles the
 	// cloud-side dispatcher while the stale local cache keeps reporting the
 	// dead session as active, leaving the UI stuck and unable to recover.
+	a.sessionManager.InvalidateSession(nodeID)
+
+	return nil
+}
+
+// DisconnectEdgeView ends the EdgeView session on the controller (for every
+// client of that device, like disconnecting it in the ZEDEDA UI), then closes
+// this launcher's tunnels to the device and drops the cached session. If the
+// controller refuses, local state is left alone: the session is still live.
+func (a *App) DisconnectEdgeView(nodeID string) error {
+	if err := a.zededaClient.DisableEdgeView(nodeID); err != nil {
+		return fmt.Errorf("failed to disconnect EdgeView: %w", err)
+	}
+
+	for _, t := range a.sessionManager.ListTunnels(nodeID) {
+		if err := a.sessionManager.CloseTunnel(t.ID); err != nil {
+			fmt.Printf("Warning: failed to close tunnel %s: %v\n", t.ID, err)
+		}
+	}
 	a.sessionManager.InvalidateSession(nodeID)
 
 	return nil

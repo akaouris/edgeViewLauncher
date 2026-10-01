@@ -119,3 +119,39 @@ func TestGetEdgeViewStatus_ExpireSecFormats(t *testing.T) {
 		})
 	}
 }
+
+// TestDisableEdgeView verifies the controller call that ends a device's
+// EdgeView session (the same effect as disconnecting it in the ZEDEDA UI).
+func TestDisableEdgeView(t *testing.T) {
+	var gotMethod, gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "tok")
+	if err := c.DisableEdgeView("dev-1"); err != nil {
+		t.Fatalf("DisableEdgeView: %v", err)
+	}
+	if gotMethod != http.MethodPut || gotPath != "/api/v1/devices/id/dev-1/edgeview/disable" || gotAuth != "Bearer tok" {
+		t.Fatalf("unexpected request: %s %s auth=%q", gotMethod, gotPath, gotAuth)
+	}
+}
+
+func TestDisableEdgeView_Errors(t *testing.T) {
+	status := http.StatusUnauthorized
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "tok")
+	if err := c.DisableEdgeView("dev-1"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized, got %v", err)
+	}
+	status = http.StatusInternalServerError
+	if err := c.DisableEdgeView("dev-1"); err == nil || errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected a non-auth error for 500, got %v", err)
+	}
+}

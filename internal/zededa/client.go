@@ -694,6 +694,36 @@ func (c *Client) StartEdgeView(nodeID string) error {
 	return nil
 }
 
+// DisableEdgeView ends the device's EdgeView session on the controller —
+// the same effect as disconnecting it in the ZEDEDA UI (the controller then
+// reports an empty token and expireSec "0").
+func (c *Client) DisableEdgeView(nodeID string) error {
+	url := fmt.Sprintf("%s/api/v1/devices/id/%s/edgeview/disable", c.BaseURL, nodeID)
+
+	req, err := http.NewRequest("PUT", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%w", ErrUnauthorized)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to disconnect EdgeView (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
 // StopEdgeView disables EdgeView on the device
 func (c *Client) StopEdgeView(nodeID string) error {
 	url := fmt.Sprintf("%s/api/v1/devices/id/%s/edgeview/enable", c.BaseURL, nodeID)

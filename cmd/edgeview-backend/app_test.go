@@ -28,11 +28,13 @@ type fakeZededaClient struct {
 	addSSHKeyErr error
 
 	// EdgeView status & control
-	edgeStatus    *zededa.EdgeViewStatus
-	edgeStatusErr error
-	disableErr    error
-	stopErr       error
-	startErr      error
+	edgeStatus     *zededa.EdgeViewStatus
+	edgeStatusErr  error
+	disableErr     error
+	stopErr        error
+	disableEVErr   error
+	disableEVCalls []string
+	startErr       error
 
 	// Cloud API for apps/services
 	deviceApps    []zededa.AppInstance
@@ -91,6 +93,10 @@ func (f *fakeZededaClient) GetEdgeViewStatus(nodeID string) (*zededa.EdgeViewSta
 func (f *fakeZededaClient) DisableSSH(nodeID, ourKey string) error { return f.disableErr }
 func (f *fakeZededaClient) StopEdgeView(nodeID string) error {
 	return f.stopErr
+}
+func (f *fakeZededaClient) DisableEdgeView(nodeID string) error {
+	f.disableEVCalls = append(f.disableEVCalls, nodeID)
+	return f.disableEVErr
 }
 func (f *fakeZededaClient) StartEdgeView(nodeID string) error {
 	return f.startErr
@@ -957,6 +963,57 @@ func TestGetSSHStatus_CloudActiveUsesControllerExpiry(t *testing.T) {
 	}
 	if status.Port != 4321 {
 		t.Fatalf("expected cached proxy port to be preserved, got %d", status.Port)
+	}
+}
+
+// TestDisconnectEdgeView ends the session on the controller, closes only
+// this device's tunnels, and drops the cached session.
+func TestDisconnectEdgeView(t *testing.T) {
+	fakeClient := &fakeZededaClient{}
+	fakeSess := &fakeSessionManager{
+		cached: map[string]*session.CachedSession{"node1": {ExpiresAt: time.Now().Add(time.Hour)}},
+		tunnels: map[string]*session.Tunnel{
+			"t-ssh":   {ID: "t-ssh", NodeID: "node1"},
+			"t-vnc":   {ID: "t-vnc", NodeID: "node1"},
+			"t-other": {ID: "t-other", NodeID: "node2"},
+		},
+	}
+	a := newTestApp(fakeClient, fakeSess)
+
+	if err := a.DisconnectEdgeView("node1"); err != nil {
+		t.Fatalf("DisconnectEdgeView: %v", err)
+	}
+	if len(fakeClient.disableEVCalls) != 1 || fakeClient.disableEVCalls[0] != "node1" {
+		t.Fatalf("expected one controller disable call for node1, got %v", fakeClient.disableEVCalls)
+	}
+	if _, ok := fakeSess.tunnels["t-other"]; !ok || len(fakeSess.tunnels) != 1 {
+		t.Fatalf("expected only node1 tunnels closed, remaining: %v", fakeSess.tunnels)
+	}
+	if _, ok := fakeSess.cached["node1"]; ok {
+		t.Fatalf("expected cached session to be invalidated")
+	}
+}
+
+// TestDisconnectEdgeView_ControllerErrorKeepsLocalState leaves tunnels and
+// cache untouched when the controller refuses, so nothing is torn down for a
+// session that is still running.
+func TestDisconnectEdgeView_ControllerErrorKeepsLocalState(t *testing.T) {
+	fakeClient := &fakeZededaClient{disableEVErr: zededa.ErrUnauthorized}
+	fakeSess := &fakeSessionManager{
+		cached:  map[string]*session.CachedSession{"node1": {ExpiresAt: time.Now().Add(time.Hour)}},
+		tunnels: map[string]*session.Tunnel{"t-ssh": {ID: "t-ssh", NodeID: "node1"}},
+	}
+	a := newTestApp(fakeClient, fakeSess)
+
+	err := a.DisconnectEdgeView("node1")
+	if !errors.Is(err, zededa.ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized to propagate, got %v", err)
+	}
+	if len(fakeSess.closedTunnels) != 0 {
+		t.Fatalf("expected no tunnels closed, got %v", fakeSess.closedTunnels)
+	}
+	if _, ok := fakeSess.cached["node1"]; !ok {
+		t.Fatalf("expected cached session to be kept")
 	}
 }
 

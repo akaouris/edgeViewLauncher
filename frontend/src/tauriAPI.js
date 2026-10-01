@@ -79,6 +79,9 @@ export const DisableSSH = (nodeId) =>
 export const ResetEdgeView = (nodeId) =>
     apiCall('/api/reset-edgeview', 'POST', { nodeId }).then(r => r?.data);
 
+export const DisconnectEdgeView = (nodeId) =>
+    apiCall('/api/disconnect-edgeview', 'POST', { nodeId }).then(r => r?.data);
+
 export const VerifyTunnel = (nodeId) =>
     apiCall('/api/verify-tunnel', 'POST', { nodeId }).then(r => r?.data);
 

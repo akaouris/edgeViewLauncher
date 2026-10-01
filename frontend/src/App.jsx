@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { ConnectToNode, CancelConnection, GetSettings, SaveSettings, GetDeviceServices, SetupSSH, GetSSHStatus, DisableSSH, SetVGAEnabled, SetUSBEnabled, SetConsoleEnabled, EnableExternalPolicy, ResetEdgeView, VerifyTunnel, GetUserInfo, GetEnterprise, GetProjects, GetSessionStatus, GetConnectionProgress, GetAppInfo, StartTunnel, CloseTunnel, ListTunnels, AddRecentDevice, VerifyToken, ProbeBaseUrl, OnUpdateAvailable, OnUpdateNotAvailable, OnUpdateDownloadProgress, OnUpdateDownloaded, OnUpdateError, DownloadUpdate, InstallUpdate, SecureStorageStatus, SecureStorageMigrate, SecureStorageGetSettings, SecureStorageSaveSettings, StartCollectInfo, GetCollectInfoStatus, SaveCollectInfo, StartComposeDiagnostics, GetComposeDiagnosticsStatus, SaveComposeDiagnostics, CheckForUpdates, openTerminalWindow, openVncWindow, openExternalTerminal, getElectronAppInfo, startContainerShell, getSystemTimeFormat, openExternal, InjectSecureConfig, GetDeviceCache, RefreshDeviceCache, OnTunnelClosing, EmitTunnelsChanged } from './tauriAPI';
-import { Search, Settings, Server, Activity, Save, Monitor, ArrowLeft, Terminal, Globe, Lock, Unlock, AlertTriangle, ChevronDown, ChevronRight, X, Plus, Check, AlertCircle, Cpu, Wifi, HardDrive, Clock, Hash, ExternalLink, Copy, Play, RefreshCw, Trash2, ArrowRight, Info, Download, Box, Layers, Shield, Moon, Sun, HelpCircle, Key } from 'lucide-react';
+import { ConnectToNode, CancelConnection, GetSettings, SaveSettings, GetDeviceServices, SetupSSH, GetSSHStatus, DisableSSH, SetVGAEnabled, SetUSBEnabled, SetConsoleEnabled, EnableExternalPolicy, ResetEdgeView, DisconnectEdgeView, VerifyTunnel, GetUserInfo, GetEnterprise, GetProjects, GetSessionStatus, GetConnectionProgress, GetAppInfo, StartTunnel, CloseTunnel, ListTunnels, AddRecentDevice, VerifyToken, ProbeBaseUrl, OnUpdateAvailable, OnUpdateNotAvailable, OnUpdateDownloadProgress, OnUpdateDownloaded, OnUpdateError, DownloadUpdate, InstallUpdate, SecureStorageStatus, SecureStorageMigrate, SecureStorageGetSettings, SecureStorageSaveSettings, StartCollectInfo, GetCollectInfoStatus, SaveCollectInfo, StartComposeDiagnostics, GetComposeDiagnosticsStatus, SaveComposeDiagnostics, CheckForUpdates, openTerminalWindow, openVncWindow, openExternalTerminal, getElectronAppInfo, startContainerShell, getSystemTimeFormat, openExternal, InjectSecureConfig, GetDeviceCache, RefreshDeviceCache, OnTunnelClosing, EmitTunnelsChanged } from './tauriAPI';
+import { Search, Settings, Server, Activity, Save, Monitor, ArrowLeft, Terminal, Globe, Lock, Unlock, AlertTriangle, ChevronDown, ChevronRight, X, Plus, Check, AlertCircle, Cpu, Wifi, HardDrive, Clock, Hash, ExternalLink, Copy, Play, RefreshCw, Trash2, ArrowRight, Info, Download, Box, Layers, Shield, Moon, Sun, HelpCircle, Key, Unplug } from 'lucide-react';
 import eveOsIcon from './assets/eve-os.png';
 import Tooltip from './components/Tooltip';
 import About from './components/About';
@@ -542,6 +542,7 @@ function App() {
   const [expandedServiceId, setExpandedServiceId] = useState(null);
   const [expandedServiceContainers, setExpandedServiceContainers] = useState({});
   const [highlightTunnels, setHighlightTunnels] = useState(false);
+  const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
   const [activeTunnels, setActiveTunnels] = useState([]); // Track active tunnels across all devices
   const [showGlobalTunnels, setShowGlobalTunnels] = useState(false);
   const [tunnelConnected, setTunnelConnected] = useState(false);
@@ -2563,6 +2564,37 @@ Do you want to try connecting anyway?`)) {
     }
   };
 
+  // Ends the EdgeView session on the controller (same as disconnecting it in
+  // the ZEDEDA UI). A cloud-config action, so deliberately not gated on the
+  // device being online — only on there being a session to end.
+  // Runs only after the user confirms in the Disconnect dialog.
+  const handleDisconnectEdgeView = async () => {
+    setShowDisconnectConfirm(false);
+    if (!selectedNode) return;
+    const nodeId = selectedNode.id;
+
+    setGlobalStatus({ type: 'loading', message: 'Disconnecting EdgeView session...' });
+    addLog('Disconnecting EdgeView session...');
+    try {
+      await DisconnectEdgeView(nodeId);
+      setAuthError(false); // authenticated write succeeded → token is valid
+      setActiveTunnels(prev => prev.filter(t => t.nodeId !== nodeId));
+      addLog('EdgeView session disconnected', 'success');
+      await loadSSHStatus(nodeId, false);
+    } catch (err) {
+      console.error('DisconnectEdgeView failed:', err);
+      if (isAuthError(err)) {
+        handleAuthError();
+      } else {
+        const errMsg = err.message || String(err);
+        addLog(`Disconnect failed: ${errMsg}`, 'error');
+        setGlobalStatus({ type: 'error', message: `Failed to disconnect EdgeView: ${errMsg}` });
+        return;
+      }
+    }
+    setGlobalStatus(null);
+  };
+
   const handleEnableExternalPolicy = async () => {
     if (!selectedNode || !sshStatus) {
       setGlobalStatus({ type: 'error', message: "No node selected or status unknown." });
@@ -4429,6 +4461,19 @@ Do you want to try connecting anyway?`)) {
                         </div>
                       )}
                     </div>
+                      <button
+                        className="connect-btn secondary"
+                        onClick={() => setShowDisconnectConfirm(true)}
+                        disabled={!isSessionConnected && !sessionUnverified}
+                        title={!isSessionConnected && !sessionUnverified ? "No active EdgeView session" : "Disconnect EdgeView session on the controller"}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 12px', fontSize: '12px',
+                          ...(isSessionConnected || sessionUnverified ? { color: 'var(--color-danger)', borderColor: 'var(--color-danger)' } : {})
+                        }}
+                      >
+                        <Unplug size={16} />
+                        Disconnect
+                      </button>
                     </div>
                   </div>
 
@@ -5652,6 +5697,36 @@ Do you want to try connecting anyway?`)) {
             )}
 
             {selectedNode && <ActivityLog logs={logs} />}
+
+            {
+              showDisconnectConfirm && selectedNode && (() => {
+                const tunnelCount = activeTunnels.filter(t => t.nodeId === selectedNode.id).length;
+                return (
+                  <Modal
+                    title="Disconnect EdgeView Session"
+                    isOpen={showDisconnectConfirm}
+                    onDismiss={() => setShowDisconnectConfirm(false)}
+                    size="small"
+                    footer={
+                      <>
+                        <Button variant="secondary" onClick={() => setShowDisconnectConfirm(false)}>
+                          Cancel
+                        </Button>
+                        <Button variant="danger" icon={<Unplug size={14} />} onClick={handleDisconnectEdgeView}>
+                          Disconnect
+                        </Button>
+                      </>
+                    }
+                  >
+                    <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.5 }}>
+                      This ends the EdgeView session for <strong>{selectedNode.name}</strong> on the controller,
+                      for everyone using this device.
+                      {tunnelCount > 0 && <> It also closes {tunnelCount} open tunnel{tunnelCount === 1 ? '' : 's'}.</>}
+                    </p>
+                  </Modal>
+                );
+              })()
+            }
 
             {
               tcpTunnelConfig && (
