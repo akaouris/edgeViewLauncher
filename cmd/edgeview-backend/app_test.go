@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -787,6 +788,62 @@ func TestGetSSHStatus_DisabledWhenNoDeviceKey(t *testing.T) {
 	}
 	if st.MaxSessions != 2 || st.Expiry != "12345" || !st.DebugKnob {
 		t.Fatalf("unexpected EdgeView metadata: %+v", st)
+	}
+}
+
+// TestGetSSHStatus_CloudStoppedInvalidatesCache reproduces EdgeView being
+// disconnected from the ZEDEDA controller while the launcher still holds a
+// cached session. The controller then reports an empty token and
+// expireSec "0" (captured live from control.sigma-edge.com); the stale cache
+// must not keep the UI showing the session as active.
+func TestGetSSHStatus_CloudStoppedInvalidatesCache(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	m := session.NewManager()
+	m.StoreCachedSession("node1", &zededa.SessionConfig{URL: "wss://example"}, 0, "", time.Now().Add(5*time.Hour))
+
+	fakeClient := &fakeZededaClient{
+		edgeStatus: &zededa.EdgeViewStatus{Token: "", Expiry: "0", DispURL: "cloud.example/api/v1/edge-view"},
+	}
+	a := newTestApp(fakeClient, m)
+
+	st := a.GetSSHStatus("node1")
+	if st.Expiry != "0" {
+		t.Fatalf("expected cloud expiry '0' when EdgeView is stopped, got %q", st.Expiry)
+	}
+	if status := a.GetSessionStatus("node1"); status.Active {
+		t.Fatalf("expected cached session to be invalidated, got active=true")
+	}
+}
+
+// TestGetSSHStatus_CloudActiveUsesControllerExpiry ensures that while the
+// controller reports a live session the cache is kept, but the expiry
+// reported (by both status calls) is the controller's, not the local estimate.
+func TestGetSSHStatus_CloudActiveUsesControllerExpiry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	m := session.NewManager()
+	m.StoreCachedSession("node1", &zededa.SessionConfig{URL: "wss://example"}, 4321, "tunnel-1", time.Now().Add(4*time.Hour))
+
+	cloudExpiry := time.Now().Add(5 * time.Hour).Truncate(time.Second)
+	fakeClient := &fakeZededaClient{
+		edgeStatus: &zededa.EdgeViewStatus{Token: "jwt", Expiry: fmt.Sprintf("%d", cloudExpiry.Unix())},
+	}
+	a := newTestApp(fakeClient, m)
+
+	st := a.GetSSHStatus("node1")
+	if want := fmt.Sprintf("%d", cloudExpiry.Unix()); st.Expiry != want {
+		t.Fatalf("expected controller expiry %s, got %q", want, st.Expiry)
+	}
+	status := a.GetSessionStatus("node1")
+	if !status.Active {
+		t.Fatalf("expected cached session to remain active")
+	}
+	if want := cloudExpiry.Format(time.RFC3339); status.ExpiresAt != want {
+		t.Fatalf("expected session expiry %s, got %s", want, status.ExpiresAt)
+	}
+	if status.Port != 4321 {
+		t.Fatalf("expected cached proxy port to be preserved, got %d", status.Port)
 	}
 }
 

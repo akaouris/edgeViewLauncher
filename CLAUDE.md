@@ -55,7 +55,7 @@ Go Backend (sidecar) — cmd/edgeview-backend/
 
 ## Development Commands
 
-All commands run from the **project root** unless noted.
+All commands run from the **project root** unless noted. The root `Makefile` wraps these (`make help` lists targets; `make dev` rebuilds the Go backend then starts the app, `make check` vets, tests and builds).
 
 ```bash
 # Start full dev environment (spawns Vite + Tauri; Go backend must be pre-built)

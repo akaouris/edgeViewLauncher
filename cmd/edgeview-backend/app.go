@@ -13,6 +13,7 @@ import (
 	"net"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1215,14 +1216,35 @@ func (a *App) GetSSHStatus(nodeID string) *SSHStatus {
 		sshStatus.ManagementIPs = uniqueStrings(ips)
 	}
 
-	// Override expiry with cached session if available and valid
-	if cached, ok := a.sessionManager.GetCachedSession(nodeID); ok {
-		if time.Now().Before(cached.ExpiresAt) {
-			sshStatus.Expiry = fmt.Sprintf("%d", cached.ExpiresAt.Unix())
-		}
+	// The controller is the source of truth for the session state. When
+	// EdgeView is stopped there (e.g. disconnected from the ZEDEDA UI) it
+	// clears the token and resets expireSec to "0": drop the local cache so
+	// it can't keep reporting the dead session as active. While the session
+	// is live, align the cache with the controller's expiry so every status
+	// call reports the controller's value rather than our local estimate.
+	cloudExpiry, active := cloudSessionExpiry(evStatus)
+	if !active {
+		a.sessionManager.InvalidateSession(nodeID)
+	} else if cached, ok := a.sessionManager.GetCachedSession(nodeID); ok && !cached.ExpiresAt.Equal(cloudExpiry) {
+		a.sessionManager.StoreCachedSession(nodeID, cached.Config, cached.Port, cached.TunnelID, cloudExpiry)
 	}
 
 	return sshStatus
+}
+
+// cloudSessionExpiry returns the controller's EdgeView session expiry and
+// whether that session is live: a non-empty token and an expireSec in the
+// future.
+func cloudSessionExpiry(st *zededa.EdgeViewStatus) (time.Time, bool) {
+	if st.Token == "" {
+		return time.Time{}, false
+	}
+	sec, err := strconv.ParseInt(st.Expiry, 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	exp := time.Unix(sec, 0)
+	return exp, time.Now().Before(exp)
 }
 
 // containsIdentity reports whether any parsed authorized-key has the
