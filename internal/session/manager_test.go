@@ -754,3 +754,60 @@ func TestCloseTunnelLeavesUnrelatedCachedSessionsAlone(t *testing.T) {
 		t.Errorf("nodeB cache should be untouched, got Port=%d TunnelID=%q", s.Port, s.TunnelID)
 	}
 }
+
+// TestAlignCachedSession_UpdatesOnlyExpiry checks the controller's expiry is
+// applied without touching the proxy port/tunnel the cache entry tracks.
+func TestAlignCachedSession_UpdatesOnlyExpiry(t *testing.T) {
+	m := NewManager()
+	m.StoreCachedSession("node-1", &zededa.SessionConfig{Token: "jwt-a"}, 4321, "tunnel-1", time.Now().Add(time.Hour))
+
+	want := time.Now().Add(5 * time.Hour).Truncate(time.Second)
+	if !m.AlignCachedSession("node-1", "jwt-a", want) {
+		t.Fatalf("expected the session to be kept when the token matches")
+	}
+	got, ok := m.GetCachedSession("node-1")
+	if !ok || !got.ExpiresAt.Equal(want) || got.Port != 4321 || got.TunnelID != "tunnel-1" {
+		t.Fatalf("unexpected cache entry after align: ok=%v %+v", ok, got)
+	}
+}
+
+// TestAlignCachedSession_ReMintedTokenDropsEntry: a different controller
+// token means the session was re-minted, so the cached config is stale.
+func TestAlignCachedSession_ReMintedTokenDropsEntry(t *testing.T) {
+	m := NewManager()
+	m.StoreCachedSession("node-1", &zededa.SessionConfig{Token: "jwt-old"}, 0, "", time.Now().Add(time.Hour))
+
+	if m.AlignCachedSession("node-1", "jwt-new", time.Now().Add(5*time.Hour)) {
+		t.Fatalf("expected a re-minted token to drop the cached session")
+	}
+	if _, ok := m.GetCachedSession("node-1"); ok {
+		t.Fatalf("expected cached session to be removed")
+	}
+}
+
+// TestAlignCachedSession_ConcurrentWithTunnelTeardown runs align alongside
+// the tunnel-teardown path that mutates the same entry; run with -race.
+func TestAlignCachedSession_ConcurrentWithTunnelTeardown(t *testing.T) {
+	m := NewManager()
+	m.StoreCachedSession("node-1", &zededa.SessionConfig{Token: "jwt"}, 4321, "tunnel-1", time.Now().Add(time.Hour))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			m.AlignCachedSession("node-1", "jwt", time.Now().Add(5*time.Hour))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			m.clearCachedPortForTunnel("tunnel-1")
+		}
+	}()
+	wg.Wait()
+
+	if got, ok := m.GetCachedSession("node-1"); !ok || got.Port != 0 || got.TunnelID != "" {
+		t.Fatalf("align must not resurrect a torn-down tunnel's port: ok=%v %+v", ok, got)
+	}
+}

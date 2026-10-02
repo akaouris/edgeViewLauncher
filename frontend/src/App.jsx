@@ -1394,6 +1394,10 @@ function App() {
   // Session is connected if we have a valid active session (non-expired with timestamp)
   // tunnelConnected is just a bonus verification, not required
   const isSessionConnected = !sessionExpired && expiryInfo.timestamp !== null;
+  // GetSSHStatus reports 'unknown' only when the controller could not be
+  // reached. The cached session still drives button gating (so a network blip
+  // doesn't block an open tunnel), but the UI must not claim it as verified.
+  const sessionUnverified = sshStatus?.status === 'unknown';
   const isDeviceOnline = isInteractive(selectedNode?.status);
 
   // State for time format preference
@@ -2162,12 +2166,9 @@ function App() {
       }
     }).finally(() => {
       setLoadingServices(false);
-      GetSessionStatus(node.id).then(status => {
-        if (status.active) {
-          setSessionStatus(status);
-          addLog(`EdgeView session active (refreshed)`, 'success');
-        }
-      }).catch(console.error);
+      // Session status is refreshed by loadSSHStatus below, after the cloud
+      // check has dropped any stale cache entry. Fetching it here as well
+      // raced that check and could restore a dead session as active.
     });
 
     loadSSHStatus(node.id, true);
@@ -2181,17 +2182,22 @@ function App() {
     try {
       const status = await GetSSHStatus(nodeId);
       setSshStatus(status);
-      addLog(`SSH Status: ${status.status} `);
+      const unverified = status.status === 'unknown';
+      if (unverified) {
+        addLog('Could not reach controller — EdgeView session status unverified', 'warning');
+      } else {
+        addLog(`SSH Status: ${status.status} `);
+      }
       try {
         sessStatus = await GetSessionStatus(nodeId);
         setSessionStatus(sessStatus);
-        if (sessStatus.active) {
+        if (sessStatus.active && !unverified) {
           addLog(`EdgeView session active (expires: ${new Date(sessStatus.expiresAt).toLocaleString(undefined, getTimeFormatOptions())})`, 'success');
         }
       } catch (err) {
         console.error('Failed to get session status:', err);
       }
-      if (checkTunnel) {
+      if (checkTunnel && !unverified) {
         setGlobalStatus({ type: 'loading', message: "Verifying EdgeView tunnel..." });
         // REMOVED: addLog("Verifying EdgeView tunnel connectivity..."); (too verbose)
         try {
@@ -4467,8 +4473,10 @@ Do you want to try connecting anyway?`)) {
                             <Tooltip text="Whether an active EdgeView session is established to this device." helpUrl="https://help.zededa.com/hc/en-us/articles/39473586111003-Edge-View-Overview" simple>
                               <div className="status-label" style={{ cursor: 'help' }}>SESSION</div>
                             </Tooltip>
-                            <div className={`status-value ${isSessionConnected ? 'success' : 'error'}`}>
-                              {isSessionConnected ? (
+                            <div className={`status-value ${sessionUnverified ? 'mismatch' : isSessionConnected ? 'success' : 'error'}`}>
+                              {sessionUnverified ? (
+                                <span title="Could not reach the controller to verify the session"><HelpCircle size={14} /> Unknown</span>
+                              ) : isSessionConnected ? (
                                 <><Check size={14} /> Activated</>
                               ) : (
                                 <><X size={14} /> Inactive</>
@@ -4479,8 +4487,8 @@ Do you want to try connecting anyway?`)) {
                             <Tooltip text="Time remaining before the EdgeView session token expires (~5h default)." helpUrl="https://lf-edge.atlassian.net/wiki/spaces/EVE/pages/14584760/Edge-View+Architecture" simple>
                               <div className="status-label" style={{ cursor: 'help' }}>EXPIRES</div>
                             </Tooltip>
-                            <div className={`status-value ${expiryInfo.colorClass}`}>
-                              {expiryInfo.timestamp ? (
+                            <div className={`status-value ${sessionUnverified ? '' : expiryInfo.colorClass}`}>
+                              {expiryInfo.timestamp && !sessionUnverified ? (
                                 <span title={new Date(expiryInfo.timestamp).toLocaleString(undefined, getTimeFormatOptions())}>
                                   {expiryInfo.label}
                                 </span>

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1388,8 +1389,13 @@ func (c *Client) GetEdgeViewStatus(nodeID string) (*EdgeViewStatus, error) {
 			if num, ok := jwtInfo["numInst"].(float64); ok {
 				status.MaxSessions = int(num)
 			}
-			if exp, ok := jwtInfo["expireSec"].(string); ok {
+			// Observed as a string ("1790855448", "0"); accept a JSON
+			// number too rather than leaving the expiry unreadable.
+			switch exp := jwtInfo["expireSec"].(type) {
+			case string:
 				status.Expiry = exp
+			case float64:
+				status.Expiry = strconv.FormatInt(int64(exp), 10)
 			}
 			if enc, ok := jwtInfo["encrypt"].(bool); ok {
 				status.IsEncrypted = enc

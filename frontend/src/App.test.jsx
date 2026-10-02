@@ -1570,6 +1570,49 @@ describe('EdgeView session controls', () => {
     });
   });
 
+  it('refresh shows the session inactive once EdgeView is stopped on the controller', async () => {
+    const node = { id: 'node-1', name: 'EV-Test', status: 'online', project: 'proj-1' };
+    electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
+    electronAPI.GetDeviceServices.mockResolvedValue(JSON.stringify([]));
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: String(Math.floor(Date.now() / 1000) + 3600) });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: true, expiresAt: new Date(Date.now() + 3600000).toISOString() });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('EV-Test'));
+    await screen.findByText('Activated');
+
+    // Controller now reports the session gone: backend drops its cache and
+    // passes through the cloud's expireSec "0".
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: '0' });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: false });
+    fireEvent.click(screen.getByTitle('Refresh device status'));
+
+    await screen.findByText('Inactive');
+    expect(screen.queryByText('Activated')).not.toBeInTheDocument();
+    await screen.findByText(/No active EdgeView session/);
+  });
+
+  it('refresh shows the session as Unknown when the controller cannot be reached', async () => {
+    const node = { id: 'node-1', name: 'EV-Test', status: 'online', project: 'proj-1' };
+    electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
+    electronAPI.GetDeviceServices.mockResolvedValue(JSON.stringify([]));
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: String(Math.floor(Date.now() / 1000) + 3600) });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: true, expiresAt: new Date(Date.now() + 3600000).toISOString() });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('EV-Test'));
+    await screen.findByText('Activated');
+
+    // Controller GET fails: backend returns status 'unknown' and keeps its
+    // cache, so GetSessionStatus still reports the cached session as active.
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'unknown' });
+    fireEvent.click(screen.getByTitle('Refresh device status'));
+
+    await screen.findByText('Unknown');
+    expect(screen.queryByText('Activated')).not.toBeInTheDocument();
+    await screen.findByText(/Could not reach controller/);
+  });
+
   it('clicking SSH Enabled chip calls DisableSSH', async () => {
     const node = { id: 'node-1', name: 'SSH-Test', status: 'online', project: 'proj-1' };
     electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
