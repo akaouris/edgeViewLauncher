@@ -40,6 +40,7 @@ vi.mock('./tauriAPI', () => {
     EnableExternalPolicy: vi.fn(fn),
     ResetEdgeView: vi.fn(fn),
     DisconnectEdgeView: vi.fn(fn),
+    StartEdgeViewSession: vi.fn(fn),
     VerifyTunnel: vi.fn(fn),
     GetUserInfo: vi.fn(fn),
     GetEnterprise: vi.fn().mockResolvedValue({ name: 'Test Enterprise' }),
@@ -364,8 +365,9 @@ describe('App configuration and tunnels', () => {
 
     await screen.findByText('Running Applications');
 
-    const connectButton = screen.getByRole('button', { name: /\bconnect\b/i });
-    fireEvent.click(connectButton);
+    // The app row's Connect button (not the header's EdgeView Connect toggle).
+    const appRow = screen.getByText('App 1').closest('.service-item');
+    fireEvent.click(within(appRow).getByRole('button', { name: /\bconnect\b/i }));
 
     const launchVncLabel = await screen.findByText('Launch VNC');
     const launchVncButton = launchVncLabel.closest('.option-btn');
@@ -503,8 +505,9 @@ describe('App configuration and tunnels', () => {
 
     await screen.findByText('Running Applications');
 
-    const connectButton = screen.getByRole('button', { name: /\bconnect\b/i });
-    fireEvent.click(connectButton);
+    // The app row's Connect button (not the header's EdgeView Connect toggle).
+    const appRow = screen.getByText('App 1').closest('.service-item');
+    fireEvent.click(within(appRow).getByRole('button', { name: /\bconnect\b/i }));
 
     const launchSshButton = await screen.findByText('Launch SSH');
     fireEvent.click(launchSshButton.closest('.option-btn'));
@@ -1642,7 +1645,8 @@ describe('EdgeView session controls', () => {
     await screen.findByText('Inactive');
     await screen.findByText(/EdgeView session disconnected/);
     expect(screen.queryByText('Disconnect EdgeView Session')).not.toBeInTheDocument();
-    expect(screen.getByTitle('No active EdgeView session')).toBeDisabled();
+    // The toggle now offers to start a new session.
+    expect(screen.getByTitle('Start an EdgeView session on the controller')).toHaveTextContent('Connect');
   });
 
   it('Disconnect does nothing when the confirmation is cancelled', async () => {
@@ -1662,6 +1666,56 @@ describe('EdgeView session controls', () => {
     expect(screen.queryByText('Disconnect EdgeView Session')).not.toBeInTheDocument();
     expect(electronAPI.DisconnectEdgeView).not.toHaveBeenCalled();
     expect(screen.getByText('Activated')).toBeInTheDocument();
+  });
+
+  it('Connect starts an EdgeView session on the controller when there is none', async () => {
+    const node = { id: 'node-1', name: 'EV-Test', status: 'online', project: 'proj-1' };
+    electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
+    electronAPI.GetDeviceServices.mockResolvedValue(JSON.stringify([]));
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: '0' });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: false });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('EV-Test'));
+    await screen.findByText('Inactive');
+
+    electronAPI.StartEdgeViewSession.mockImplementation(async () => {
+      electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: String(Math.floor(Date.now() / 1000) + 18000) });
+      electronAPI.GetSessionStatus.mockResolvedValue({ active: false });
+    });
+    fireEvent.click(screen.getByTitle('Start an EdgeView session on the controller'));
+
+    await waitFor(() => expect(electronAPI.StartEdgeViewSession).toHaveBeenCalledWith('node-1'));
+    await screen.findByText('Activated');
+    expect(screen.getByTitle('Disconnect EdgeView session on the controller')).toHaveTextContent('Disconnect');
+  });
+
+  it('Connect works on an offline device (cloud-config, not gated on online)', async () => {
+    const node = { id: 'node-1', name: 'EV-Offline', status: 'offline', project: 'proj-1' };
+    electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
+    electronAPI.GetDeviceServices.mockResolvedValue(JSON.stringify([]));
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: '0' });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: false });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('EV-Offline'));
+    const connect = await screen.findByTitle('Start an EdgeView session on the controller');
+    expect(connect).not.toBeDisabled();
+    fireEvent.click(connect);
+    await waitFor(() => expect(electronAPI.StartEdgeViewSession).toHaveBeenCalledWith('node-1'));
+  });
+
+  it('Connect/Disconnect is disabled when the controller cannot be reached', async () => {
+    const node = { id: 'node-1', name: 'EV-Test', status: 'online', project: 'proj-1' };
+    electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
+    electronAPI.GetDeviceServices.mockResolvedValue(JSON.stringify([]));
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'unknown' });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: true, expiresAt: new Date(Date.now() + 3600000).toISOString() });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('EV-Test'));
+    await screen.findByText('Unknown');
+    expect(screen.getByTitle("Can't reach controller")).toBeDisabled();
   });
 
   it('clicking SSH Enabled chip calls DisableSSH', async () => {

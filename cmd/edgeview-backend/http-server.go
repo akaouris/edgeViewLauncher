@@ -346,6 +346,21 @@ func (s *HTTPServer) handleDisconnectEdgeView(w http.ResponseWriter, r *http.Req
 	s.sendSuccess(w, map[string]bool{"disconnected": true})
 }
 
+func (s *HTTPServer) handleStartEdgeView(w http.ResponseWriter, r *http.Request) {
+	var req NodeIDRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.sendError(w, err)
+		return
+	}
+
+	if err := s.app.StartEdgeViewSession(req.NodeID); err != nil {
+		s.sendError(w, err)
+		return
+	}
+
+	s.sendSuccess(w, map[string]bool{"started": true})
+}
+
 func (s *HTTPServer) handleVerifyTunnel(w http.ResponseWriter, r *http.Request) {
 	var req NodeIDRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -598,6 +613,7 @@ func (s *HTTPServer) Start() {
 	router.HandleFunc("/api/disable-ssh", s.handleDisableSSH)
 	router.HandleFunc("/api/reset-edgeview", s.handleResetEdgeView)
 	router.HandleFunc("/api/disconnect-edgeview", s.handleDisconnectEdgeView)
+	router.HandleFunc("/api/start-edgeview", s.handleStartEdgeView)
 	router.HandleFunc("/api/verify-tunnel", s.handleVerifyTunnel)
 	router.HandleFunc("/api/recent-device", s.handleAddRecentDevice)
 	router.HandleFunc("/api/user-info", s.handleGetUserInfo)

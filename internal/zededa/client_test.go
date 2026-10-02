@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -153,5 +154,39 @@ func TestDisableEdgeView_Errors(t *testing.T) {
 	status = http.StatusInternalServerError
 	if err := c.DisableEdgeView("dev-1"); err == nil || errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected a non-auth error for 500, got %v", err)
+	}
+}
+
+// TestEdgeViewControlRequests pins the request each EdgeView control call
+// sends, and that any 2xx counts as success (a 204 from /disable means the
+// session ended; reporting it as a failure would leave tunnels and cache up).
+func TestEdgeViewControlRequests(t *testing.T) {
+	cases := []struct {
+		name     string
+		call     func(*Client) error
+		wantPath string
+		wantBody string
+	}{
+		{"start", func(c *Client) error { return c.StartEdgeView("dev-1") }, "/api/v1/devices/id/dev-1/edgeview/enable", `{"debugKnob":true,"expiry":60}`},
+		{"stop", func(c *Client) error { return c.StopEdgeView("dev-1") }, "/api/v1/devices/id/dev-1/edgeview/enable", `{"debugKnob":false,"expiry":60}`},
+		{"disable", func(c *Client) error { return c.DisableEdgeView("dev-1") }, "/api/v1/devices/id/dev-1/edgeview/disable", ``},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath, gotBody string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				gotMethod, gotPath, gotBody = r.Method, r.URL.Path, string(b)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+
+			if err := tc.call(NewClient(srv.URL, "tok")); err != nil {
+				t.Fatalf("expected 204 to be success, got %v", err)
+			}
+			if gotMethod != http.MethodPut || gotPath != tc.wantPath || gotBody != tc.wantBody {
+				t.Fatalf("unexpected request: %s %s body=%q", gotMethod, gotPath, gotBody)
+			}
+		})
 	}
 }

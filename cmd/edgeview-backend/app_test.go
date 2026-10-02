@@ -21,6 +21,7 @@ import (
 type fakeZededaClient struct {
 	initSessionScript string
 	initSessionErr    error
+	onInitSession     func() // runs inside InitSession, e.g. to simulate a concurrent Disconnect
 
 	parseCfg *zededa.SessionConfig
 	parseErr error
@@ -35,6 +36,7 @@ type fakeZededaClient struct {
 	disableEVErr   error
 	disableEVCalls []string
 	startErr       error
+	startCalls     []string
 
 	// Cloud API for apps/services
 	deviceApps    []zededa.AppInstance
@@ -75,6 +77,9 @@ func (f *fakeZededaClient) SearchNodesWithTokenCtx(ctx context.Context, query st
 }
 func (f *fakeZededaClient) UpdateConfig(baseURL, token string) {}
 func (f *fakeZededaClient) InitSession(targetID string) (string, error) {
+	if f.onInitSession != nil {
+		f.onInitSession()
+	}
 	return f.initSessionScript, f.initSessionErr
 }
 func (f *fakeZededaClient) ParseEdgeViewScript(script string) (*zededa.SessionConfig, error) {
@@ -99,6 +104,7 @@ func (f *fakeZededaClient) DisableEdgeView(nodeID string) error {
 	return f.disableEVErr
 }
 func (f *fakeZededaClient) StartEdgeView(nodeID string) error {
+	f.startCalls = append(f.startCalls, nodeID)
 	return f.startErr
 }
 func (f *fakeZededaClient) GetDeviceAppInstances(deviceID, deviceName string) ([]zededa.AppInstance, error) {
@@ -200,6 +206,7 @@ type fakeSessionManager struct {
 	launched bool
 
 	closedTunnels []string
+	onStartProxy  func() // runs inside StartProxy/StartProxyMulti before they succeed
 }
 
 func (m *fakeSessionManager) GetCachedSession(nodeID string) (*session.CachedSession, bool) {
@@ -226,12 +233,18 @@ func (m *fakeSessionManager) StoreCachedSession(nodeID string, cfg *zededa.Sessi
 }
 
 func (m *fakeSessionManager) StartProxy(ctx context.Context, cfg *zededa.SessionConfig, nodeID string, target string, protocol string, onProgress func(string)) (int, string, error) {
+	if m.onStartProxy != nil {
+		m.onStartProxy()
+	}
 	return m.startProxyPort, m.startProxyID, m.startProxyErr
 }
 
 func (m *fakeSessionManager) StartProxyMulti(ctx context.Context, cfg *zededa.SessionConfig, nodeID string, candidateIPs []string, targetPort int, protocol string, onProgress func(string)) (int, string, error) {
 	m.lastMultiCandidateIPs = append([]string(nil), candidateIPs...)
 	m.lastMultiTargetPort = targetPort
+	if m.onStartProxy != nil {
+		m.onStartProxy()
+	}
 	return m.startProxyPort, m.startProxyID, m.startProxyErr
 }
 
@@ -991,6 +1004,84 @@ func TestDisconnectEdgeView(t *testing.T) {
 	}
 	if _, ok := fakeSess.cached["node1"]; ok {
 		t.Fatalf("expected cached session to be invalidated")
+	}
+}
+
+// TestDisconnectEdgeView_CancelsInFlightConnect: a connect still running when
+// the user disconnects must be cancelled, or it can re-cache the revoked
+// session after Disconnect has cleared it.
+func TestDisconnectEdgeView_CancelsInFlightConnect(t *testing.T) {
+	a := newTestApp(&fakeZededaClient{}, &fakeSessionManager{})
+	ctx, release := a.beginConnection("node1")
+	defer release()
+
+	if err := a.DisconnectEdgeView("node1"); err != nil {
+		t.Fatalf("DisconnectEdgeView: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatalf("expected the in-flight connection to be cancelled")
+	}
+}
+
+// TestConnectToNode_CancelledAfterProxyDoesNotCache: a connect cancelled
+// (e.g. by Disconnect) just as its proxy came up must not cache the session,
+// and must close the tunnel it just opened.
+func TestConnectToNode_CancelledAfterProxyDoesNotCache(t *testing.T) {
+	fakeClient := &fakeZededaClient{
+		initSessionScript: "edgeview -token tok",
+		parseCfg:          &zededa.SessionConfig{URL: "wss://example", Token: "tok"},
+	}
+	fakeSess := &fakeSessionManager{startProxyPort: 9001, startProxyID: "tunnel-123"}
+	a := newTestApp(fakeClient, fakeSess)
+	fakeSess.onStartProxy = func() { a.CancelConnection("node2") }
+
+	if _, _, err := a.ConnectToNode("node2", false, ""); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if _, ok := fakeSess.cached["node2"]; ok {
+		t.Fatalf("expected no cached session after cancellation")
+	}
+	if len(fakeSess.closedTunnels) != 1 || fakeSess.closedTunnels[0] != "tunnel-123" {
+		t.Fatalf("expected the just-opened tunnel to be closed, got %v", fakeSess.closedTunnels)
+	}
+}
+
+// TestStartTunnel_CancelledBeforeCacheDoesNotCache: cancellation during
+// session setup must stop StartTunnel before it caches the session.
+func TestStartTunnel_CancelledBeforeCacheDoesNotCache(t *testing.T) {
+	fakeClient := &fakeZededaClient{
+		edgeStatusErr:     errors.New("no active session"),
+		initSessionScript: "edgeview -token tok",
+		parseCfg:          &zededa.SessionConfig{URL: "wss://example", Token: "tok"},
+	}
+	fakeSess := &fakeSessionManager{startProxyPort: 9002, startProxyID: "tunnel-456"}
+	a := newTestApp(fakeClient, fakeSess)
+	fakeClient.onInitSession = func() { a.CancelConnection("node3") }
+
+	if _, _, err := a.StartTunnel("node3", "10.0.0.1", 5900, ""); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if _, ok := fakeSess.cached["node3"]; ok {
+		t.Fatalf("expected no cached session after cancellation")
+	}
+}
+
+// TestStartEdgeViewSession enables EdgeView on the controller and surfaces
+// its errors (e.g. ErrUnauthorized for the "Update Token" prompt).
+func TestStartEdgeViewSession(t *testing.T) {
+	fakeClient := &fakeZededaClient{}
+	a := newTestApp(fakeClient, &fakeSessionManager{})
+
+	if err := a.StartEdgeViewSession("node1"); err != nil {
+		t.Fatalf("StartEdgeViewSession: %v", err)
+	}
+	if len(fakeClient.startCalls) != 1 || fakeClient.startCalls[0] != "node1" {
+		t.Fatalf("expected one StartEdgeView call for node1, got %v", fakeClient.startCalls)
+	}
+
+	fakeClient.startErr = zededa.ErrUnauthorized
+	if err := a.StartEdgeViewSession("node1"); !errors.Is(err, zededa.ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized to propagate, got %v", err)
 	}
 }
 

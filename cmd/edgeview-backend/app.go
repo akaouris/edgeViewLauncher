@@ -210,6 +210,18 @@ func (a *App) beginConnection(nodeID string) (context.Context, func()) {
 	return ctx, cleanup
 }
 
+// connectionCancelled reports whether a connect attempt was cancelled (e.g. by
+// DisconnectEdgeView) and, if so, records it. Callers check it right before
+// caching a session, so a cancelled attempt can't re-cache a session that
+// Disconnect has just cleared.
+func (a *App) connectionCancelled(ctx context.Context, nodeID string) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	a.SetConnectionProgress(nodeID, "Cancelled")
+	return true
+}
+
 // sameFunc is a best-effort pointer comparison of two CancelFuncs. Since Go
 // does not allow == on funcs, we compare via reflect.ValueOf.Pointer.
 func sameFunc(a, b context.CancelFunc) bool {
@@ -602,6 +614,14 @@ func (a *App) ConnectToNode(nodeID string, useInAppTerminal bool, targetIP strin
 			return 0, "", fmt.Errorf("failed to start proxy on any candidate IP: %w", err)
 		}
 		fmt.Printf("Successfully connected via candidate set %v\n", candidateIPs)
+		if a.connectionCancelled(ctx, nodeID) {
+			// Cancelled as the proxy came up: don't keep a tunnel or cache
+			// entry for a session the user just asked to end.
+			if err := a.sessionManager.CloseTunnel(tunnelID); err != nil {
+				fmt.Printf("Warning: failed to close tunnel %s: %v\n", tunnelID, err)
+			}
+			return 0, "", ctx.Err()
+		}
 
 		// Cache the session config (always cache token/URL, cache port only for native terminal)
 		portToCache := 0
@@ -674,6 +694,9 @@ func (a *App) StartTunnel(nodeID, targetIP string, targetPort int, protocol stri
 				// But we need to use the existing cache's expiry if available, or set a new one?
 				// Since we are reusing an active session, let's refresh the expiry in our cache too.
 				newExpires := time.Now().Add(4*time.Hour + 50*time.Minute)
+				if a.connectionCancelled(ctx, nodeID) {
+					return 0, "", ctx.Err()
+				}
 
 				// Preserve port if reusing for same purpose (but here we are starting a new tunnel so port is dynamic)
 				// Actually, StartTunnel doesn't care about cached port unless it's reusing the whole session for the SAME tunnel.
@@ -703,6 +726,9 @@ func (a *App) StartTunnel(nodeID, targetIP string, targetPort int, protocol stri
 			}
 		}
 
+		if a.connectionCancelled(ctx, nodeID) {
+			return 0, "", ctx.Err()
+		}
 		expiresAt := time.Now().Add(4*time.Hour + 50*time.Minute)
 		a.sessionManager.StoreCachedSession(nodeID, sessionConfig, 0, "", expiresAt)
 		cached, _ = a.sessionManager.GetCachedSession(nodeID)
@@ -784,6 +810,9 @@ func (a *App) StartTunnel(nodeID, targetIP string, targetPort int, protocol stri
 					break
 				}
 
+				if a.connectionCancelled(ctx, nodeID) {
+					return 0, "", ctx.Err()
+				}
 				expiresAt := time.Now().Add(4*time.Hour + 50*time.Minute)
 				a.sessionManager.StoreCachedSession(nodeID, newConfig, 0, "", expiresAt)
 				cached = &session.CachedSession{Config: newConfig, ExpiresAt: expiresAt} // Update local var
@@ -1330,20 +1359,30 @@ func (a *App) ResetEdgeView(nodeID string) error {
 
 // DisconnectEdgeView ends the EdgeView session on the controller (for every
 // client of that device, like disconnecting it in the ZEDEDA UI), then closes
-// this launcher's tunnels to the device and drops the cached session. If the
-// controller refuses, local state is left alone: the session is still live.
+// this launcher's tunnels to the device and drops the cached session. Any
+// connect still in flight is cancelled first, so it unwinds during the
+// controller round trip instead of re-caching the revoked session afterwards.
+// If the controller refuses, tunnels and cache are left alone: the session
+// is still live.
 func (a *App) DisconnectEdgeView(nodeID string) error {
+	a.CancelConnection(nodeID)
+
 	if err := a.zededaClient.DisableEdgeView(nodeID); err != nil {
 		return fmt.Errorf("failed to disconnect EdgeView: %w", err)
 	}
 
-	for _, t := range a.sessionManager.ListTunnels(nodeID) {
-		if err := a.sessionManager.CloseTunnel(t.ID); err != nil {
-			fmt.Printf("Warning: failed to close tunnel %s: %v\n", t.ID, err)
-		}
-	}
-	a.sessionManager.InvalidateSession(nodeID)
+	a.dropDeviceSession(nodeID)
+	return nil
+}
 
+// StartEdgeViewSession enables EdgeView on the controller so the device has a
+// session to connect to (the Connect half of the Connect/Disconnect toggle).
+// Like Disconnect it is a cloud-config change, so it works while the device
+// is offline: the device picks it up when it reconnects.
+func (a *App) StartEdgeViewSession(nodeID string) error {
+	if err := a.zededaClient.StartEdgeView(nodeID); err != nil {
+		return fmt.Errorf("failed to start EdgeView: %w", err)
+	}
 	return nil
 }
 
