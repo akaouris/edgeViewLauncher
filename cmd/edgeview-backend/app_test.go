@@ -192,6 +192,8 @@ type fakeSessionManager struct {
 	lastMultiTargetPort   int
 
 	launched bool
+
+	closedTunnels []string
 }
 
 func (m *fakeSessionManager) GetCachedSession(nodeID string) (*session.CachedSession, bool) {
@@ -236,9 +238,34 @@ func (m *fakeSessionManager) ExecuteCommand(nodeID string, command string) (stri
 	return "", errors.New("not implemented")
 }
 
-func (m *fakeSessionManager) CloseTunnel(tunnelID string) error { return nil }
+func (m *fakeSessionManager) AlignCachedSession(nodeID, token string, expiresAt time.Time) bool {
+	s, ok := m.cached[nodeID]
+	if !ok {
+		return true
+	}
+	if s.Config != nil && s.Config.Token != "" && s.Config.Token != token {
+		delete(m.cached, nodeID)
+		return false
+	}
+	s.ExpiresAt = expiresAt
+	return true
+}
 
-func (m *fakeSessionManager) ListTunnels(nodeID string) []*session.Tunnel { return nil }
+func (m *fakeSessionManager) CloseTunnel(tunnelID string) error {
+	m.closedTunnels = append(m.closedTunnels, tunnelID)
+	delete(m.tunnels, tunnelID)
+	return nil
+}
+
+func (m *fakeSessionManager) ListTunnels(nodeID string) []*session.Tunnel {
+	var out []*session.Tunnel
+	for _, t := range m.tunnels {
+		if t.NodeID == nodeID {
+			out = append(out, t)
+		}
+	}
+	return out
+}
 
 func (m *fakeSessionManager) GetAllTunnels() []*session.Tunnel { return nil }
 
@@ -771,11 +798,15 @@ func TestSetupSSH_Success(t *testing.T) {
 // TestGetSSHStatus_DisabledWhenNoDeviceKey ensures that when device has no SSH key,
 // status is reported as disabled.
 func TestGetSSHStatus_DisabledWhenNoDeviceKey(t *testing.T) {
+	// A live controller session, so its expiry is passed through as-is (an
+	// ended session reports "0"; see TestGetSSHStatus_CloudStoppedReportsZeroExpiry).
+	expiry := fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix())
 	fakeClient := &fakeZededaClient{
 		edgeStatus: &zededa.EdgeViewStatus{
 			SSHKey:      "",
 			MaxSessions: 2,
-			Expiry:      "12345",
+			Token:       "jwt",
+			Expiry:      expiry,
 			DebugKnob:   true,
 		},
 	}
@@ -786,7 +817,7 @@ func TestGetSSHStatus_DisabledWhenNoDeviceKey(t *testing.T) {
 	if st.Status != "disabled" {
 		t.Fatalf("expected status 'disabled', got %q", st.Status)
 	}
-	if st.MaxSessions != 2 || st.Expiry != "12345" || !st.DebugKnob {
+	if st.MaxSessions != 2 || st.Expiry != expiry || !st.DebugKnob {
 		t.Fatalf("unexpected EdgeView metadata: %+v", st)
 	}
 }
@@ -813,6 +844,88 @@ func TestGetSSHStatus_CloudStoppedInvalidatesCache(t *testing.T) {
 	}
 	if status := a.GetSessionStatus("node1"); status.Active {
 		t.Fatalf("expected cached session to be invalidated, got active=true")
+	}
+}
+
+// TestGetSSHStatus_CloudStoppedReportsZeroExpiry: with the token cleared the
+// session is gone even if expireSec is still in the future, and the reported
+// expiry must say so, or the frontend falls back to it and shows "Activated".
+func TestGetSSHStatus_CloudStoppedReportsZeroExpiry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	future := fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix())
+	fakeClient := &fakeZededaClient{edgeStatus: &zededa.EdgeViewStatus{Token: "", Expiry: future}}
+	a := newTestApp(fakeClient, session.NewManager())
+
+	if st := a.GetSSHStatus("node1"); st.Expiry != "0" {
+		t.Fatalf("expected expiry '0' for a session the controller has ended, got %q", st.Expiry)
+	}
+}
+
+// TestGetSSHStatus_CloudStoppedClosesTunnels: a session ended on the
+// controller (e.g. from the ZEDEDA UI) also closes this device's tunnels,
+// which can no longer work, leaving other devices' tunnels alone.
+func TestGetSSHStatus_CloudStoppedClosesTunnels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	fakeClient := &fakeZededaClient{edgeStatus: &zededa.EdgeViewStatus{Token: "", Expiry: "0"}}
+	fakeSess := &fakeSessionManager{
+		cached: map[string]*session.CachedSession{"node1": {ExpiresAt: time.Now().Add(time.Hour)}},
+		tunnels: map[string]*session.Tunnel{
+			"t-ssh":   {ID: "t-ssh", NodeID: "node1"},
+			"t-other": {ID: "t-other", NodeID: "node2"},
+		},
+	}
+	a := newTestApp(fakeClient, fakeSess)
+
+	a.GetSSHStatus("node1")
+	if len(fakeSess.closedTunnels) != 1 || fakeSess.closedTunnels[0] != "t-ssh" {
+		t.Fatalf("expected only node1's tunnel closed, got %v", fakeSess.closedTunnels)
+	}
+	if _, ok := fakeSess.cached["node1"]; ok {
+		t.Fatalf("expected cached session to be invalidated")
+	}
+}
+
+// TestGetSSHStatus_ReMintedTokenDropsCache: the controller issued a new token
+// (e.g. after an EdgeView config change), so the cached config is stale and
+// must not be extended to the new session's expiry.
+func TestGetSSHStatus_ReMintedTokenDropsCache(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	m := session.NewManager()
+	m.StoreCachedSession("node1", &zededa.SessionConfig{Token: "jwt-old"}, 0, "", time.Now().Add(time.Hour))
+	cloudExpiry := time.Now().Add(5 * time.Hour).Unix()
+	fakeClient := &fakeZededaClient{
+		edgeStatus: &zededa.EdgeViewStatus{Token: "jwt-new", Expiry: fmt.Sprintf("%d", cloudExpiry)},
+	}
+	a := newTestApp(fakeClient, m)
+
+	st := a.GetSSHStatus("node1")
+	if st.Expiry != fmt.Sprintf("%d", cloudExpiry) {
+		t.Fatalf("expected the controller's expiry, got %q", st.Expiry)
+	}
+	if a.GetSessionStatus("node1").Active {
+		t.Fatalf("expected the stale cached session to be dropped")
+	}
+}
+
+// TestGetSSHStatus_UnparseableExpiryKeepsCache: a token with an expiry we
+// can't read is "unknown", not "ended": keep the cache rather than dropping a
+// working session on every status call.
+func TestGetSSHStatus_UnparseableExpiryKeepsCache(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	m := session.NewManager()
+	cachedExpiry := time.Now().Add(time.Hour).Round(0)
+	m.StoreCachedSession("node1", &zededa.SessionConfig{Token: "jwt"}, 0, "", cachedExpiry)
+	fakeClient := &fakeZededaClient{edgeStatus: &zededa.EdgeViewStatus{Token: "jwt", Expiry: ""}}
+	a := newTestApp(fakeClient, m)
+
+	a.GetSSHStatus("node1")
+	status := a.GetSessionStatus("node1")
+	if !status.Active || status.ExpiresAt != cachedExpiry.Format(time.RFC3339) {
+		t.Fatalf("expected cached session kept unchanged, got %+v", status)
 	}
 }
 

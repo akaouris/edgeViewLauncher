@@ -54,6 +54,7 @@ type sessionAPI interface {
 	GetCachedSession(nodeID string) (*session.CachedSession, bool)
 	GetTunnel(tunnelID string) (*session.Tunnel, bool)
 	StoreCachedSession(nodeID string, config *zededa.SessionConfig, port int, tunnelID string, expiresAt time.Time)
+	AlignCachedSession(nodeID, token string, expiresAt time.Time) bool
 	// StartProxy starts a persistent EdgeView proxy for the given device nodeID and target.
 	StartProxy(ctx context.Context, config *zededa.SessionConfig, nodeID string, target string, protocol string, onProgress func(string)) (int, string, error)
 	// StartProxyMulti probes multiple candidate IPs (round-robin per round,
@@ -1216,35 +1217,64 @@ func (a *App) GetSSHStatus(nodeID string) *SSHStatus {
 		sshStatus.ManagementIPs = uniqueStrings(ips)
 	}
 
-	// The controller is the source of truth for the session state. When
-	// EdgeView is stopped there (e.g. disconnected from the ZEDEDA UI) it
-	// clears the token and resets expireSec to "0": drop the local cache so
-	// it can't keep reporting the dead session as active. While the session
-	// is live, align the cache with the controller's expiry so every status
-	// call reports the controller's value rather than our local estimate.
-	cloudExpiry, active := cloudSessionExpiry(evStatus)
-	if !active {
-		a.sessionManager.InvalidateSession(nodeID)
-	} else if cached, ok := a.sessionManager.GetCachedSession(nodeID); ok && !cached.ExpiresAt.Equal(cloudExpiry) {
-		a.sessionManager.StoreCachedSession(nodeID, cached.Config, cached.Port, cached.TunnelID, cloudExpiry)
+	// The controller is the source of truth for the session state.
+	switch cloudExpiry, state := cloudSessionState(evStatus); state {
+	case cloudSessionEnded:
+		// EdgeView was stopped there (e.g. disconnected from the ZEDEDA UI):
+		// it clears the token and resets expireSec to "0". Report it as
+		// ended even if expireSec lingers, and drop our tunnels and cache so
+		// neither keeps presenting the dead session as usable.
+		sshStatus.Expiry = "0"
+		a.dropDeviceSession(nodeID)
+	case cloudSessionLive:
+		// Report the controller's expiry rather than our local estimate.
+		// A re-minted token means our cached config is stale: drop it.
+		a.sessionManager.AlignCachedSession(nodeID, evStatus.Token, cloudExpiry)
+	case cloudSessionUnknown:
+		// Token present but expiry unreadable: leave the cache alone rather
+		// than dropping a possibly working session on every status call.
 	}
 
 	return sshStatus
 }
 
-// cloudSessionExpiry returns the controller's EdgeView session expiry and
-// whether that session is live: a non-empty token and an expireSec in the
-// future.
-func cloudSessionExpiry(st *zededa.EdgeViewStatus) (time.Time, bool) {
+type cloudSessionStateKind int
+
+const (
+	cloudSessionUnknown cloudSessionStateKind = iota
+	cloudSessionLive
+	cloudSessionEnded
+)
+
+// cloudSessionState classifies the controller's EdgeView session: ended when
+// the token is empty or expireSec is in the past (the controller sends "0"
+// after a disconnect), live when a token has a future expireSec, and unknown
+// when a token is present but its expiry can't be parsed. For a live session
+// it also returns the controller's expiry.
+func cloudSessionState(st *zededa.EdgeViewStatus) (time.Time, cloudSessionStateKind) {
 	if st.Token == "" {
-		return time.Time{}, false
+		return time.Time{}, cloudSessionEnded
 	}
 	sec, err := strconv.ParseInt(st.Expiry, 10, 64)
 	if err != nil {
-		return time.Time{}, false
+		return time.Time{}, cloudSessionUnknown
 	}
 	exp := time.Unix(sec, 0)
-	return exp, time.Now().Before(exp)
+	if !time.Now().Before(exp) {
+		return time.Time{}, cloudSessionEnded
+	}
+	return exp, cloudSessionLive
+}
+
+// dropDeviceSession closes this launcher's tunnels to a device and forgets
+// its cached session, for when the EdgeView session behind them has ended.
+func (a *App) dropDeviceSession(nodeID string) {
+	for _, t := range a.sessionManager.ListTunnels(nodeID) {
+		if err := a.sessionManager.CloseTunnel(t.ID); err != nil {
+			fmt.Printf("Warning: failed to close tunnel %s: %v\n", t.ID, err)
+		}
+	}
+	a.sessionManager.InvalidateSession(nodeID)
 }
 
 // containsIdentity reports whether any parsed authorized-key has the

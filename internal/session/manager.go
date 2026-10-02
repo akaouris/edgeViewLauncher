@@ -135,6 +135,30 @@ func (m *Manager) GetCachedSession(nodeID string) (*CachedSession, bool) {
 	return session, true
 }
 
+// AlignCachedSession reconciles a cached session with the controller's live
+// session under m.mu, so it can't race the tunnel-teardown path that mutates
+// Port/TunnelID on the same entry, nor overwrite a concurrent store. If the
+// controller's token differs from the cached one the session was re-minted
+// (e.g. after an EdgeView config change) and the stale entry is dropped,
+// returning false. Otherwise only ExpiresAt is updated. A missing entry is
+// left alone and reported as kept.
+func (m *Manager) AlignCachedSession(nodeID, token string, expiresAt time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[nodeID]
+	if !ok {
+		return true
+	}
+	if s.Config != nil && s.Config.Token != "" && s.Config.Token != token {
+		delete(m.sessions, nodeID)
+		fmt.Printf("DEBUG: Dropped cached session for %s: controller re-minted the EdgeView token\n", nodeID)
+		return false
+	}
+	s.ExpiresAt = expiresAt.Round(0)
+	return true
+}
+
 // InvalidateSession removes a session from the cache
 func (m *Manager) InvalidateSession(nodeID string) {
 	m.mu.Lock()

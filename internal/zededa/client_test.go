@@ -97,3 +97,25 @@ func TestParseEdgeViewScript_InvalidToken(t *testing.T) {
 		t.Fatalf("expected error for invalid JWT token, got nil")
 	}
 }
+
+// TestGetEdgeViewStatus_ExpireSecFormats: the controller has been observed
+// sending expireSec as a string; a numeric value must parse the same way
+// rather than leaving the expiry empty.
+func TestGetEdgeViewStatus_ExpireSecFormats(t *testing.T) {
+	for name, expireSec := range map[string]string{"string": `"1790855448"`, "number": `1790855448`} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(`{"edgeviewconfig":{"token":"jwt","jwtInfo":{"expireSec":` + expireSec + `}}}`))
+			}))
+			defer srv.Close()
+
+			st, err := NewClient(srv.URL, "tok").GetEdgeViewStatus("dev-1")
+			if err != nil {
+				t.Fatalf("GetEdgeViewStatus: %v", err)
+			}
+			if st.Expiry != "1790855448" {
+				t.Fatalf("expected expiry 1790855448, got %q", st.Expiry)
+			}
+		})
+	}
+}
