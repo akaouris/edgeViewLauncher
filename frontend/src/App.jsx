@@ -547,6 +547,9 @@ function App() {
   const [expandedServiceContainers, setExpandedServiceContainers] = useState({});
   const [highlightTunnels, setHighlightTunnels] = useState(false);
   const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
+  // A Connect or Disconnect request is in flight: the toggle is disabled so a
+  // second click can't fire a duplicate controller call.
+  const [edgeViewToggleBusy, setEdgeViewToggleBusy] = useState(false);
   const [activeTunnels, setActiveTunnels] = useState([]); // Track active tunnels across all devices
   const [showGlobalTunnels, setShowGlobalTunnels] = useState(false);
   const [tunnelConnected, setTunnelConnected] = useState(false);
@@ -1403,10 +1406,15 @@ function App() {
   // reached. The cached session still drives button gating (so a network blip
   // doesn't block an open tunnel), but the UI must not claim it as verified.
   const sessionUnverified = sshStatus?.status === 'unknown';
-  // Whether the controller itself reports a live session (backend reports its
-  // expireSec when live and "0" once ended). Drives the Connect/Disconnect
-  // toggle, which must follow the controller rather than the local cache.
-  const cloudSessionLive = !sessionUnverified && parseInt(sshStatus?.expiry, 10) * 1000 > Date.now();
+  // Whether the controller itself reports a session. Drives the
+  // Connect/Disconnect toggle, which must follow the controller rather than
+  // the local cache. The backend classifies it as cloudSession: "live",
+  // "ended", or "indeterminate" (a token exists but its expiry is unreadable).
+  // Indeterminate still offers Disconnect: there is a session, and offering
+  // Connect would re-enable EdgeView on top of it.
+  const cloudSessionLive = !sessionUnverified && (sshStatus?.cloudSession
+    ? sshStatus.cloudSession !== 'ended'
+    : parseInt(sshStatus?.expiry, 10) * 1000 > Date.now());
   const isDeviceOnline = isInteractive(selectedNode?.status);
 
   // State for time format preference
@@ -2578,9 +2586,10 @@ Do you want to try connecting anyway?`)) {
   // Runs only after the user confirms in the Disconnect dialog.
   const handleDisconnectEdgeView = async () => {
     setShowDisconnectConfirm(false);
-    if (!selectedNode) return;
+    if (!selectedNode || edgeViewToggleBusy) return;
     const nodeId = selectedNode.id;
 
+    setEdgeViewToggleBusy(true);
     setGlobalStatus({ type: 'loading', message: 'Disconnecting EdgeView session...' });
     addLog('Disconnecting EdgeView session...');
     try {
@@ -2599,6 +2608,8 @@ Do you want to try connecting anyway?`)) {
         setGlobalStatus({ type: 'error', message: `Failed to disconnect EdgeView: ${errMsg}` });
         return;
       }
+    } finally {
+      setEdgeViewToggleBusy(false);
     }
     setGlobalStatus(null);
   };
@@ -2606,9 +2617,10 @@ Do you want to try connecting anyway?`)) {
   // Starts an EdgeView session on the controller. Opening a terminal or tunnel
   // stays a separate step, gated on isSessionConnected as before.
   const handleConnectEdgeView = async () => {
-    if (!selectedNode) return;
+    if (!selectedNode || edgeViewToggleBusy) return;
     const nodeId = selectedNode.id;
 
+    setEdgeViewToggleBusy(true);
     setGlobalStatus({ type: 'loading', message: 'Starting EdgeView session...' });
     addLog('Starting EdgeView session...');
     try {
@@ -2626,6 +2638,8 @@ Do you want to try connecting anyway?`)) {
         setGlobalStatus({ type: 'error', message: `Failed to start EdgeView: ${errMsg}` });
         return;
       }
+    } finally {
+      setEdgeViewToggleBusy(false);
     }
     setGlobalStatus(null);
   };
@@ -4500,7 +4514,7 @@ Do you want to try connecting anyway?`)) {
                         <button
                           className="connect-btn secondary"
                           onClick={cloudSessionLive ? () => setShowDisconnectConfirm(true) : handleConnectEdgeView}
-                          disabled={sessionUnverified}
+                          disabled={sessionUnverified || edgeViewToggleBusy}
                           title={sessionUnverified
                             ? "Can't reach controller"
                             : cloudSessionLive

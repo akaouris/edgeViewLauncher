@@ -110,6 +110,11 @@ type App struct {
 
 	// Device/project cache
 	deviceCache *cache.Manager
+
+	// Nodes with a ResetEdgeView in progress (nodeID -> struct{}). While a
+	// reset runs, the controller briefly reports the session as ended between
+	// its stop and start; GetSSHStatus must not tear down tunnels for that.
+	resettingNodes sync.Map
 }
 
 // NewApp creates a new App application struct
@@ -1142,6 +1147,11 @@ type SSHStatus struct {
 	IsEncrypted    bool     `json:"isEncrypted"`
 	ExternalPolicy bool     `json:"externalPolicy"`
 	ManagementIPs  []string `json:"managementIPs"`
+	// CloudSession is the controller's view of the EdgeView session: "live",
+	// "ended", or "indeterminate" (a token is present but its expiry can't be
+	// read). Empty when the controller could not be reached (Status
+	// "unknown"). Drives the Connect/Disconnect toggle.
+	CloudSession string `json:"cloudSession,omitempty"`
 	// AuthorizedKeys is the parsed list of keys currently in
 	// debug.enable.ssh on the device. Used by the audit panel in the UI;
 	// the entry with IsLauncherKey=true is the one this launcher manages.
@@ -1255,14 +1265,21 @@ func (a *App) GetSSHStatus(nodeID string) *SSHStatus {
 		// ended even if expireSec lingers, and drop our tunnels and cache so
 		// neither keeps presenting the dead session as usable.
 		sshStatus.Expiry = "0"
-		a.dropDeviceSession(nodeID)
+		sshStatus.CloudSession = "ended"
+		// A reset in progress is between its stop and start: the session is
+		// about to come back, and the reset itself drops the cache after.
+		if _, resetting := a.resettingNodes.Load(nodeID); !resetting {
+			a.dropDeviceSession(nodeID)
+		}
 	case cloudSessionLive:
 		// Report the controller's expiry rather than our local estimate.
 		// A re-minted token means our cached config is stale: drop it.
+		sshStatus.CloudSession = "live"
 		a.sessionManager.AlignCachedSession(nodeID, evStatus.Token, cloudExpiry)
 	case cloudSessionUnknown:
 		// Token present but expiry unreadable: leave the cache alone rather
 		// than dropping a possibly working session on every status call.
+		sshStatus.CloudSession = "indeterminate"
 	}
 
 	return sshStatus
@@ -1334,6 +1351,9 @@ func (a *App) DisableSSH(nodeID string) error {
 
 // ResetEdgeView recycles the EdgeView session to clear stuck connections
 func (a *App) ResetEdgeView(nodeID string) error {
+	a.resettingNodes.Store(nodeID, struct{}{})
+	defer a.resettingNodes.Delete(nodeID)
+
 	// Attempt to stop EdgeView - ignore errors as it may already be inactive
 	if err := a.zededaClient.StopEdgeView(nodeID); err != nil {
 		fmt.Printf("Warning: Could not stop EdgeView (may already be inactive): %v\n", err)
@@ -1383,8 +1403,30 @@ func (a *App) StartEdgeViewSession(nodeID string) error {
 	if err := a.zededaClient.StartEdgeView(nodeID); err != nil {
 		return fmt.Errorf("failed to start EdgeView: %w", err)
 	}
+
+	// The controller can take a moment to mint the session after accepting
+	// the enable. Wait (briefly) until it reports it live, so the status
+	// refresh that follows flips the toggle to Disconnect on the first click
+	// instead of still offering Connect. Not reaching live in time is not an
+	// error: the enable was accepted and the next status refresh will see it.
+	for i := 0; i < edgeViewStartPollAttempts; i++ {
+		if st, err := a.zededaClient.GetEdgeViewStatus(nodeID); err == nil && st != nil {
+			if _, state := cloudSessionState(st); state == cloudSessionLive {
+				return nil
+			}
+		}
+		time.Sleep(edgeViewStartPollInterval)
+	}
+	fmt.Printf("Warning: EdgeView for %s not reported live yet after enable\n", nodeID)
 	return nil
 }
+
+// How long StartEdgeViewSession waits for the controller to report the new
+// session live (vars so tests can shorten them).
+var (
+	edgeViewStartPollAttempts = 10
+	edgeViewStartPollInterval = 500 * time.Millisecond
+)
 
 func (a *App) GetDeviceServices(nodeID, deviceName string) (string, error) {
 	// Use Cloud API to fetch app instances (deviceName enables server-side filter)

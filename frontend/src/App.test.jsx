@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react';
 import { vi, describe, it, beforeEach, afterEach } from 'vitest';
 
 vi.mock('./components/VncViewer', () => ({
@@ -1703,6 +1703,42 @@ describe('EdgeView session controls', () => {
     expect(connect).not.toBeDisabled();
     fireEvent.click(connect);
     await waitFor(() => expect(electronAPI.StartEdgeViewSession).toHaveBeenCalledWith('node-1'));
+  });
+
+  it('Connect is disabled while its request is in flight, so a second click does not fire', async () => {
+    const node = { id: 'node-1', name: 'EV-Test', status: 'online', project: 'proj-1' };
+    electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
+    electronAPI.GetDeviceServices.mockResolvedValue(JSON.stringify([]));
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: '0', cloudSession: 'ended' });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: false });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('EV-Test'));
+    const connect = await screen.findByTitle('Start an EdgeView session on the controller');
+
+    let finish;
+    electronAPI.StartEdgeViewSession.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    fireEvent.click(connect);
+    await waitFor(() => expect(connect).toBeDisabled());
+    fireEvent.click(connect);
+    expect(electronAPI.StartEdgeViewSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => { finish(); });
+    await waitFor(() => expect(connect).not.toBeDisabled());
+  });
+
+  it('offers Disconnect, not Connect, when the controller has a session with an unreadable expiry', async () => {
+    const node = { id: 'node-1', name: 'EV-Test', status: 'online', project: 'proj-1' };
+    electronAPI.GetDeviceCache.mockResolvedValue(makeCache([node]));
+    electronAPI.GetDeviceServices.mockResolvedValue(JSON.stringify([]));
+    electronAPI.GetSSHStatus.mockResolvedValue({ status: 'enabled', expiry: '', cloudSession: 'indeterminate' });
+    electronAPI.GetSessionStatus.mockResolvedValue({ active: false });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText('EV-Test'));
+    const toggle = await screen.findByTitle('Disconnect EdgeView session on the controller');
+    expect(toggle).toHaveTextContent('Disconnect');
+    expect(screen.queryByTitle('Start an EdgeView session on the controller')).not.toBeInTheDocument();
   });
 
   it('Connect/Disconnect is disabled when the controller cannot be reached', async () => {

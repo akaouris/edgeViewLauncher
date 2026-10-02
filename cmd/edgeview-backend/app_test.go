@@ -29,14 +29,18 @@ type fakeZededaClient struct {
 	addSSHKeyErr error
 
 	// EdgeView status & control
-	edgeStatus     *zededa.EdgeViewStatus
-	edgeStatusErr  error
-	disableErr     error
-	stopErr        error
-	disableEVErr   error
-	disableEVCalls []string
-	startErr       error
-	startCalls     []string
+	edgeStatus    *zededa.EdgeViewStatus
+	edgeStatusErr error
+	// edgeStatusSeq, when set, is returned one entry per GetEdgeViewStatus
+	// call (the last entry repeats), e.g. to model a session minted late.
+	edgeStatusSeq   []*zededa.EdgeViewStatus
+	edgeStatusCalls int
+	disableErr      error
+	stopErr         error
+	disableEVErr    error
+	disableEVCalls  []string
+	startErr        error
+	startCalls      []string
 
 	// Cloud API for apps/services
 	deviceApps    []zededa.AppInstance
@@ -90,8 +94,16 @@ func (f *fakeZededaClient) ParseEdgeViewToken(token string) (*zededa.SessionConf
 }
 func (f *fakeZededaClient) AddSSHKeyToDevice(nodeID, pubKey string) error { return f.addSSHKeyErr }
 func (f *fakeZededaClient) GetEdgeViewStatus(nodeID string) (*zededa.EdgeViewStatus, error) {
+	f.edgeStatusCalls++
 	if f.edgeStatusErr != nil {
 		return nil, f.edgeStatusErr
+	}
+	if n := len(f.edgeStatusSeq); n > 0 {
+		st := f.edgeStatusSeq[0]
+		if n > 1 {
+			f.edgeStatusSeq = f.edgeStatusSeq[1:]
+		}
+		return st, nil
 	}
 	return f.edgeStatus, nil
 }
@@ -1069,6 +1081,7 @@ func TestStartTunnel_CancelledBeforeCacheDoesNotCache(t *testing.T) {
 // TestStartEdgeViewSession enables EdgeView on the controller and surfaces
 // its errors (e.g. ErrUnauthorized for the "Update Token" prompt).
 func TestStartEdgeViewSession(t *testing.T) {
+	shortenStartPoll(t)
 	fakeClient := &fakeZededaClient{}
 	a := newTestApp(fakeClient, &fakeSessionManager{})
 
@@ -1357,4 +1370,106 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// shortenStartPoll makes StartEdgeViewSession's wait for the controller
+// instant for the duration of a test.
+func shortenStartPoll(t *testing.T) {
+	t.Helper()
+	attempts, interval := edgeViewStartPollAttempts, edgeViewStartPollInterval
+	edgeViewStartPollAttempts, edgeViewStartPollInterval = 5, 0
+	t.Cleanup(func() { edgeViewStartPollAttempts, edgeViewStartPollInterval = attempts, interval })
+}
+
+// TestStartEdgeViewSession_WaitsUntilControllerReportsLive: the controller
+// mints the session a moment after accepting the enable. Connect must wait
+// for it, so the status refresh that follows shows the session live and the
+// toggle flips to Disconnect on the first click.
+func TestStartEdgeViewSession_WaitsUntilControllerReportsLive(t *testing.T) {
+	shortenStartPoll(t)
+	live := fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix())
+	fakeClient := &fakeZededaClient{edgeStatusSeq: []*zededa.EdgeViewStatus{
+		{Token: "", Expiry: "0"},
+		{Token: "", Expiry: "0"},
+		{Token: "jwt", Expiry: live},
+	}}
+	a := newTestApp(fakeClient, &fakeSessionManager{})
+
+	if err := a.StartEdgeViewSession("node1"); err != nil {
+		t.Fatalf("StartEdgeViewSession: %v", err)
+	}
+	if fakeClient.edgeStatusCalls != 3 {
+		t.Fatalf("expected to poll until live (3 calls), got %d", fakeClient.edgeStatusCalls)
+	}
+}
+
+// TestStartEdgeViewSession_NotLiveInTimeIsNotAnError: the enable was
+// accepted; a session that isn't reported live within the wait is left to
+// the next status refresh rather than failing Connect.
+func TestStartEdgeViewSession_NotLiveInTimeIsNotAnError(t *testing.T) {
+	shortenStartPoll(t)
+	fakeClient := &fakeZededaClient{edgeStatus: &zededa.EdgeViewStatus{Token: "", Expiry: "0"}}
+	a := newTestApp(fakeClient, &fakeSessionManager{})
+
+	if err := a.StartEdgeViewSession("node1"); err != nil {
+		t.Fatalf("expected no error when the session is not live yet, got %v", err)
+	}
+	if fakeClient.edgeStatusCalls != edgeViewStartPollAttempts {
+		t.Fatalf("expected %d polls, got %d", edgeViewStartPollAttempts, fakeClient.edgeStatusCalls)
+	}
+}
+
+// TestGetSSHStatus_ReportsCloudSession pins the controller session state the
+// Connect/Disconnect toggle follows.
+func TestGetSSHStatus_ReportsCloudSession(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	live := fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix())
+	past := fmt.Sprintf("%d", time.Now().Add(-time.Hour).Unix())
+	for _, tc := range []struct {
+		name string
+		st   zededa.EdgeViewStatus
+		want string
+	}{
+		{"live", zededa.EdgeViewStatus{Token: "jwt", Expiry: live}, "live"},
+		{"no token", zededa.EdgeViewStatus{Token: "", Expiry: "0"}, "ended"},
+		{"expired", zededa.EdgeViewStatus{Token: "jwt", Expiry: past}, "ended"},
+		{"unreadable expiry", zededa.EdgeViewStatus{Token: "jwt", Expiry: ""}, "indeterminate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := tc.st
+			a := newTestApp(&fakeZededaClient{edgeStatus: &st}, session.NewManager())
+			if got := a.GetSSHStatus("node1").CloudSession; got != tc.want {
+				t.Fatalf("expected cloudSession %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestGetSSHStatus_ResetInProgressKeepsTunnels: between ResetEdgeView's stop
+// and start the controller reports the session ended. A status refresh in
+// that window must not close the device's tunnels.
+func TestGetSSHStatus_ResetInProgressKeepsTunnels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	fakeClient := &fakeZededaClient{edgeStatus: &zededa.EdgeViewStatus{Token: "", Expiry: "0"}}
+	fakeSess := &fakeSessionManager{
+		cached:  map[string]*session.CachedSession{"node1": {ExpiresAt: time.Now().Add(time.Hour)}},
+		tunnels: map[string]*session.Tunnel{"t-ssh": {ID: "t-ssh", NodeID: "node1"}},
+	}
+	a := newTestApp(fakeClient, fakeSess)
+	a.resettingNodes.Store("node1", struct{}{})
+
+	st := a.GetSSHStatus("node1")
+	if st.CloudSession != "ended" || st.Expiry != "0" {
+		t.Fatalf("expected the session still reported as ended, got %+v", st)
+	}
+	if len(fakeSess.closedTunnels) != 0 {
+		t.Fatalf("expected no tunnels closed during a reset, got %v", fakeSess.closedTunnels)
+	}
+
+	a.resettingNodes.Delete("node1")
+	a.GetSSHStatus("node1")
+	if len(fakeSess.closedTunnels) != 1 {
+		t.Fatalf("expected the tunnel closed once the reset is over, got %v", fakeSess.closedTunnels)
+	}
 }
